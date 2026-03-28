@@ -4,9 +4,11 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -84,6 +86,9 @@ class TelegramDaemonApp:
         self.child_started_at: dt.datetime | None = None
         self.child_control_bus: JsonlCommandBus | None = None
         self.pending_attachment_batches: dict[str, list[Any]] = {}
+        self.pending_pptx_run_objective: str | None = None
+        self.pending_pptx_run_source: str | None = None
+        self._clock_timer: threading.Timer | None = None
         self.btw_agent = BtwAgent(
             runner=self.daemon_runner,
             config=BtwConfig(
@@ -203,6 +208,22 @@ class TelegramDaemonApp:
 
     def _on_command(self, command) -> None:
         self._log_event("command.received", source=command.source, kind=command.kind, text=command.text[:700])
+
+        # Handle pending PPTX confirmation reply
+        if self.pending_pptx_run_objective is not None:
+            reply = command.text.strip().lower()
+            if reply in ("y", "yes", "n", "no"):
+                objective = self.pending_pptx_run_objective
+                pptx_enabled = reply in ("y", "yes")
+                self.pending_pptx_run_objective = None
+                self.pending_pptx_run_source = None
+                self._start_child(objective, pptx_report=pptx_enabled)
+                return
+            self._send_reply(command.source, "[daemon] PPTX confirmation cancelled. Send /run again to start.")
+            self.pending_pptx_run_objective = None
+            self.pending_pptx_run_source = None
+            # fall through to handle the command normally
+
         if command.kind == "help":
             self._send_reply(command.source, help_text())
             return
@@ -342,7 +363,10 @@ class TelegramDaemonApp:
                 else:
                     self._send_reply(command.source, "[daemon] active run exists but child control bus unavailable.")
                 return
-            self._start_child(self._maybe_rewrite_run_objective(objective, source=command.source))
+            # Ask about PPTX report before launching
+            self.pending_pptx_run_objective = objective
+            self.pending_pptx_run_source = command.source
+            self._send_reply(command.source, "Generate a PPTX run report at the end? Reply Y or N")
             return
         if command.kind in {"plan", "review"}:
             if not self._child_running():
@@ -386,7 +410,57 @@ class TelegramDaemonApp:
                 self._send_reply(command.source, "[btw] side-agent started. It will reply when ready.")
                 self._write_status()
             return
+        if command.kind == "clock":
+            m = re.fullmatch(r"(\d+)h(\d+)min", command.text.strip())
+            if not m:
+                self._send_reply(
+                    command.source,
+                    "[clock] invalid format.\n"
+                    "Usage: /clock <time> — e.g. `/clock 2h30min`\n"
+                    "Format must be `XhXmin` where X is a non-negative integer.\n"
+                    "Examples: `/clock 1h0min`, `/clock 0h30min`, `/clock 2h15min`",
+                )
+                return
+            hours = int(m.group(1))
+            minutes = int(m.group(2))
+            total_seconds = hours * 3600 + minutes * 60
+            if total_seconds <= 0:
+                self._send_reply(command.source, "[clock] time must be greater than zero. Example: `/clock 0h5min`")
+                return
+            if self._clock_timer is not None:
+                self._clock_timer.cancel()
+                self._clock_timer = None
+                self._send_reply(command.source, "[clock] previous timer cancelled.")
+            src = command.source
+
+            def fire_clock(_h: int = hours, _m: int = minutes, _src: str = src) -> None:
+                self._clock_timer = None
+                if not self._child_running():
+                    self._send_reply(_src, f"[clock] \u23f0 timer expired after {_h}h {_m}min \u2014 no active run.")
+                    return
+                objective_text = str(self.child_objective or "unknown")
+                self._forward_to_child("stop", "", _src)
+                assert self.child is not None
+                self.child.terminate()
+                report = (
+                    f"## \u23f0 Clock timeout \u2014 run stopped after {_h}h {_m}min\n\n"
+                    f"**Objective**: {objective_text[:500]}\n\n"
+                    f"**Elapsed**: {_h}h {_m}min\n\n"
+                    "The active run was automatically stopped by `/clock`."
+                )
+                self._send_reply(_src, report)
+
+            t = threading.Timer(float(total_seconds), fire_clock)
+            t.daemon = True
+            t.start()
+            self._clock_timer = t
+            time_desc = f"{hours}h {minutes}min" if hours > 0 else f"{minutes}min"
+            self._send_reply(command.source, f"[clock] \u23f0 timer set: run will be stopped in {time_desc} if still active.")
+            return
         if command.kind == "stop":
+            if self._clock_timer is not None:
+                self._clock_timer.cancel()
+                self._clock_timer = None
             if not self._child_running():
                 self._send_reply(command.source, "[daemon] no active run.")
                 return
@@ -401,7 +475,7 @@ class TelegramDaemonApp:
             self._send_reply(command.source, "[daemon] stopping daemon.")
             self._stopping = True
 
-    def _start_child(self, objective: str) -> None:
+    def _start_child(self, objective: str, *, pptx_report: bool = True) -> None:
         assert self.notifier is not None
         timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
         log_path = self.logs_dir / f"run-{timestamp}.log"
@@ -428,6 +502,7 @@ class TelegramDaemonApp:
             review_summaries_dir=str(review_summaries_dir),
             resume_session_id=resume_session_id,
             force_new_session=force_new_session,
+            pptx_report=pptx_report,
         )
         log_file = log_path.open("w", encoding="utf-8")
         self.child = subprocess.Popen(cmd, stdout=log_file, stderr=log_file, text=True, cwd=self.run_cwd)
@@ -528,6 +603,9 @@ class TelegramDaemonApp:
             objective=str(self.child_objective or "")[:700],
             log_path=str(self.child_log_path) if self.child_log_path else None,
         )
+        if self._clock_timer is not None:
+            self._clock_timer.cancel()
+            self._clock_timer = None
         self.child = None
         self.child_control_bus = None
 
@@ -613,6 +691,7 @@ def build_child_command(
     review_summaries_dir: str,
     resume_session_id: str | None,
     force_new_session: bool = False,
+    pptx_report: bool = True,
 ) -> list[str]:
     preset = get_preset(args.run_model_preset) if args.run_model_preset else None
     main_model = preset.main_model if preset is not None else args.run_main_model
@@ -712,6 +791,10 @@ def build_child_command(
         cmd.extend(["--state-file", args.run_state_file])
     if args.run_no_dashboard:
         cmd.append("--no-dashboard")
+    if pptx_report:
+        cmd.append("--pptx-report")
+    else:
+        cmd.append("--no-pptx-report")
     for add_dir in args.run_add_dir:
         cmd.extend(["--add-dir", add_dir])
     for plugin_dir in args.run_plugin_dir:

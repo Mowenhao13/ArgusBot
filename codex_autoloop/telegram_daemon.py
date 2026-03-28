@@ -4,10 +4,12 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import signal
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +59,7 @@ SESSION_PLAN_CONFIRMATION_EXEMPT_COMMANDS = {
     "new",
     "fresh-session",
     "stop",
+    "clock",
     "daemon-stop",
     "attachments-confirm",
     "attachments-cancel",
@@ -478,6 +481,9 @@ def main() -> None:
     scheduled_plan_request_at: dt.datetime | None = None
     pending_follow_up: PlanFollowUp | None = None
     pending_attachment_batches: dict[str, list[Any]] = {}
+    pending_pptx_run_objective: str | None = None
+    pending_pptx_run_source: str | None = None
+    clock_timer: list[threading.Timer | None] = [None]  # mutable container for the active /clock timer
     feishu_heartbeat_interval_seconds = max(0, int(args.feishu_heartbeat_interval_seconds))
     last_feishu_heartbeat_monotonic = time.monotonic()
     run_copilot_proxy = config_from_args(args, prefix="run_")
@@ -617,7 +623,7 @@ def main() -> None:
             },
         )
 
-    def start_child(objective: str, *, resume_last_session: bool = True) -> None:
+    def start_child(objective: str, *, resume_last_session: bool = True, pptx_report: bool = True) -> None:
         nonlocal child, child_objective, child_log_path, child_started_at, child_control_bus
         nonlocal child_run_id, child_control_path, child_resume_session_id
         nonlocal child_main_prompt_path, child_plan_report_path, child_plan_todo_path
@@ -655,6 +661,7 @@ def main() -> None:
             plan_todo_file=str(plan_todo_path),
             review_summaries_dir=str(review_summaries_dir),
             resume_session_id=resume_session_id,
+            pptx_report=pptx_report,
         )
         log_file = log_path.open("w", encoding="utf-8")
         child = subprocess.Popen(
@@ -828,7 +835,27 @@ def main() -> None:
         nonlocal child, child_control_bus, pending_follow_up
         nonlocal plan_mode, planner_mode
         nonlocal pending_session_plan_goal, active_session_plan_goal
+        nonlocal pending_pptx_run_objective, pending_pptx_run_source
         log_event("command.received", source=source, kind=command.kind, text=command.text[:700])
+
+        # Handle pending PPTX confirmation reply
+        if pending_pptx_run_objective is not None:
+            reply = command.text.strip().lower()
+            if reply in ("y", "yes", "n", "no"):
+                objective = pending_pptx_run_objective
+                pptx_enabled = reply in ("y", "yes")
+                pending_pptx_run_objective = None
+                pending_pptx_run_source = None
+                if pending_plan_request or scheduled_plan_request_at is not None:
+                    clear_planner_state(reason="manual_override")
+                start_child(objective, pptx_report=pptx_enabled)
+                return
+            # Non-Y/N reply while pending: cancel the pending run and fall through
+            send_reply(source, "[daemon] PPTX confirmation cancelled. Send /run again to start.")
+            pending_pptx_run_objective = None
+            pending_pptx_run_source = None
+            # fall through to handle the command normally
+
         if command.kind == "help":
             send_reply(source, help_text())
             return
@@ -1117,20 +1144,66 @@ def main() -> None:
             if pending_plan_request or scheduled_plan_request_at is not None:
                 clear_planner_state(reason="manual_override")
                 send_reply(source, "[daemon] pending plan request cleared by manual command.")
-            rewritten_objective = maybe_rewrite_run_objective(
-                enabled=bool(getattr(args, "run_objective_rewrite", False)),
-                objective=objective,
-                source=source,
-                run_cwd=run_cwd,
-                runner=daemon_runner,
-                model=(preset.main_model if preset is not None else args.run_main_model),
-                reasoning_effort=(preset.main_reasoning_effort if preset is not None else args.run_main_reasoning_effort),
-                send_reply=send_reply,
-                log_event=log_event,
-            )
-            start_child(rewritten_objective)
+            # Ask about PPTX report before launching
+            pending_pptx_run_objective = objective
+            pending_pptx_run_source = source
+            send_reply(source, "Generate a PPTX run report at the end? Reply Y or N")
+            return
+        if command.kind == "clock":
+            m = re.fullmatch(r"(\d+)h(\d+)min", command.text.strip())
+            if not m:
+                send_reply(
+                    source,
+                    "[clock] invalid format.\n"
+                    "Usage: /clock <time> — e.g. `/clock 2h30min`\n"
+                    "Format must be `XhXmin` where X is a non-negative integer.\n"
+                    "Examples: `/clock 1h0min`, `/clock 0h30min`, `/clock 2h15min`",
+                )
+                return
+            hours = int(m.group(1))
+            minutes = int(m.group(2))
+            total_seconds = hours * 3600 + minutes * 60
+            if total_seconds <= 0:
+                send_reply(source, "[clock] time must be greater than zero. Example: `/clock 0h5min`")
+                return
+            if clock_timer[0] is not None:
+                clock_timer[0].cancel()
+                clock_timer[0] = None
+                send_reply(source, "[clock] previous timer cancelled.")
+
+            def fire_clock(_h: int = hours, _m: int = minutes, _src: str = source) -> None:
+                clock_timer[0] = None
+                running = child is not None and child.poll() is None
+                if not running:
+                    send_reply(_src, f"[clock] \u23f0 timer expired after {_h}h {_m}min \u2014 no active run.")
+                    return
+                objective_text = str(child_objective or "unknown")
+                forwarded = forward_to_child("stop", "", _src)
+                assert child is not None
+                stop_outcome = "graceful" if wait_for_process_exit(child, timeout_seconds=STOP_GRACE_SECONDS) else "forced"
+                if stop_outcome == "forced":
+                    terminate_process_tree(child)
+                report = (
+                    f"## \u23f0 Clock timeout \u2014 run stopped after {_h}h {_m}min\n\n"
+                    f"**Objective**: {objective_text[:500]}\n\n"
+                    f"**Elapsed**: {_h}h {_m}min\n\n"
+                    f"**Stop outcome**: {stop_outcome}\n\n"
+                    "The active run was automatically stopped by `/clock`."
+                )
+                send_reply(_src, report)
+                log_event("child.clock.stop", hours=_h, minutes=_m, source=_src, outcome=stop_outcome)
+
+            t = threading.Timer(float(total_seconds), fire_clock)
+            t.daemon = True
+            t.start()
+            clock_timer[0] = t
+            time_desc = f"{hours}h {minutes}min" if hours > 0 else f"{minutes}min"
+            send_reply(source, f"[clock] \u23f0 timer set: run will be stopped in {time_desc} if still active.")
             return
         if command.kind == "stop":
+            if clock_timer[0] is not None:
+                clock_timer[0].cancel()
+                clock_timer[0] = None
             running = child is not None and child.poll() is None
             if not running:
                 send_reply(source, "[daemon] no active run.")
@@ -1497,6 +1570,9 @@ def main() -> None:
                 send_follow_up_prompt()
             if pending_follow_up is None and pending_plan_request is None and scheduled_plan_request_at is None:
                 active_session_plan_goal = None
+            if clock_timer[0] is not None:
+                clock_timer[0].cancel()
+                clock_timer[0] = None
             child = None
             child_control_bus = None
             child_run_id = None
@@ -1544,6 +1620,7 @@ def build_child_command(
     plan_todo_file: str,
     review_summaries_dir: str = "",
     resume_session_id: str | None,
+    pptx_report: bool = True,
 ) -> list[str]:
     planner_mode = resolve_planner_mode(planner_enabled_flag=args.run_planner, planner_mode=args.run_planner_mode)
     preset = get_preset(args.run_model_preset) if args.run_model_preset else None
@@ -1663,6 +1740,10 @@ def build_child_command(
         cmd.extend(["--state-file", args.run_state_file])
     if args.run_no_dashboard:
         cmd.append("--no-dashboard")
+    if pptx_report:
+        cmd.append("--pptx-report")
+    else:
+        cmd.append("--no-pptx-report")
     if getattr(args, "run_plan_mode", PLAN_MODE_FULLY_PLAN) == PLAN_MODE_FULLY_PLAN:
         cmd.append("--follow-up-phase")
     else:
@@ -2329,6 +2410,7 @@ def help_text() -> str:
         "/show-review-context - print current reviewer direction, checks, and criteria\n"
         "/status - daemon + child status\n"
         "/stop - stop active run\n"
+        "/clock <XhXmin> - set a max run time; auto-stop if not done by then (e.g. /clock 2h30min)\n"
         "/daemon-stop - stop daemon process\n"
         "/help - show this help\n"
         "[CN] 默认不会自动续跑。若要启用 auto planning / auto follow-up，请先使用 /plan 确认本 session 总目标。\n"
